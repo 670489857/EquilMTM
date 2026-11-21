@@ -8,14 +8,48 @@ struct EquilMTMDemoApp: App {
     }
 }
 
+/// 需要二次确认的给药动作
+enum PumpAction: Identifiable {
+    case bolus(total: Double, extended: Double, minutes: Int)
+    case prime(units: Double)
+
+    var id: String {
+        switch self {
+        case .bolus(let t, let e, let m): return "bolus-\(t)-\(e)-\(m)"
+        case .prime(let u): return "prime-\(u)"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .bolus: return "确认大剂量"
+        case .prime: return "确认排气"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case let .bolus(total, extended, minutes):
+            if extended > 0 {
+                return String(format: "总量 %.2f U，其中扩展 %.2f U / %d 分钟", total, extended, minutes)
+            }
+            return String(format: "立即推注 %.2f U", total)
+        case let .prime(units):
+            return String(format: "排气 %.2f U", units)
+        }
+    }
+}
+
 final class PumpViewModel: ObservableObject {
     @Published var stateText = "未连接"
     @Published var modeText = "未知"
     @Published var basalRates: [Double] = Array(repeating: 0, count: 48)
     @Published var tempText = "无"
+    @Published var bolusText = "无"
     @Published var settings: [SettingIndex: Int] = [:]
     @Published var records: [HistoryRecord] = []
     @Published var log: [String] = []
+    @Published var bolusRatio: Int = 1
 
     private let session = PumpSession()
 
@@ -45,7 +79,8 @@ final class PumpViewModel: ObservableObject {
 
     func readAll() {
         for command in [PumpCommands.readMode(), PumpCommands.readBasalProfile(),
-                        PumpCommands.readTemporaryProfile(), PumpCommands.readSetting()] {
+                        PumpCommands.readTemporaryProfile(), PumpCommands.readBolusProfile(),
+                        PumpCommands.readSetting()] {
             session.send(command)
         }
         append("读取状态")
@@ -59,6 +94,33 @@ final class PumpViewModel: ObservableObject {
     func setTemp(rate: Double, minutes: Int) {
         session.send(PumpCommands.setTemporaryBasal(rate: rate, minutes: minutes))
         append(String(format: "临时基础率 %.2f U/h × %d 分钟", rate, minutes))
+    }
+
+    func deliverBolus(total: Double, extended: Double, minutes: Int) {
+        let plan = EntityCodec.bolusPlan(totalUnits: total, extendedUnits: extended,
+                                         intervalSeconds: minutes * 60, bolusRatio: bolusRatio)
+        session.send(PumpCommands.setBolus(plan: plan))
+        append(String(format: "大剂量 %.2fU（扩展 %.2fU/%dmin）ratio=%d → a0=%d i0=%d a1=%d i1=%d",
+                      total, extended, minutes, bolusRatio,
+                      plan.immediateMilliUnits * 25, plan.immediatePulses,
+                      plan.extendedMilliUnits, plan.intervalSeconds))
+        bolusText = String(format: "已下发 %.2f U", total)
+    }
+
+    func stopBolus() {
+        session.send(PumpCommands.stopBolus())
+        append("停止大剂量")
+        bolusText = "已停止"
+    }
+
+    func prime(units: Double) {
+        session.send(PumpCommands.setPriming(units: units))
+        append(String(format: "排气 %.2fU → %d", units, (EntityCodec.milliUnits(units) * 4) / 25))
+    }
+
+    func rewind() {
+        session.send(PumpCommands.rewind())
+        append("回填")
     }
 
     func readHistory() {
@@ -79,9 +141,12 @@ final class PumpViewModel: ObservableObject {
         case (PumpOperation.get, DeliveryParameter.basalProfile.rawValue):
             parseBasal(message.data)
         case (PumpOperation.get, DeliveryParameter.setting.rawValue):
-            if let parsed = EntityCodec.parseSetting(message.data) { settings = parsed }
+            if let parsed = EntityCodec.parseSetting(message.data) {
+                settings = parsed
+                if let ratio = parsed[.bolusRatio], ratio > 0 { bolusRatio = ratio }
+            }
         case (PumpOperation.get, DeliveryParameter.mode.rawValue):
-            modeText = "\(message.data.first ?? 0)"
+            modeText = "\(Int32(littleEndian: message.data))"
         case (PumpOperation.get, DeliveryParameter.temporaryProfile.rawValue):
             parseTemp(message.data)
         case (_, MonitorParameter.history.rawValue):
@@ -121,10 +186,25 @@ final class PumpViewModel: ObservableObject {
     }
 }
 
+private extension Int32 {
+    init(littleEndian data: Data) {
+        let b = [UInt8](data.prefix(4))
+        guard b.count == 4 else { self = 0; return }
+        self = Int32(bitPattern: UInt32(b[0]) | UInt32(b[1]) << 8
+            | UInt32(b[2]) << 16 | UInt32(b[3]) << 24)
+    }
+}
+
 struct PumpView: View {
     @StateObject private var vm = PumpViewModel()
     @State private var tempRate: Double = 1.0
     @State private var tempMinutes: Double = 30
+
+    @State private var bolusTotal: Double = 0
+    @State private var bolusExtended: Double = 0
+    @State private var bolusMinutes: Double = 0
+    @State private var primeUnits: Double = 2.0
+    @State private var pending: PumpAction?
 
     var body: some View {
         NavigationStack {
@@ -148,6 +228,61 @@ struct PumpView: View {
                         Button("暂停") { vm.setRun(.suspend) }
                         Spacer()
                         Button("停止") { vm.setRun(.stop) }
+                    }
+                    .buttonStyle(.borderless)
+                }
+
+                Section("大剂量") {
+                    HStack {
+                        Text("总量 U")
+                        Spacer()
+                        TextField("0.00", value: $bolusTotal, format: .number)
+                            .keyboardType(.decimalPad)
+                            .multilineTextAlignment(.trailing)
+                            .frame(width: 90)
+                    }
+                    HStack {
+                        Text("其中扩展 U")
+                        Spacer()
+                        TextField("0.00", value: $bolusExtended, format: .number)
+                            .keyboardType(.decimalPad)
+                            .multilineTextAlignment(.trailing)
+                            .frame(width: 90)
+                    }
+                    HStack {
+                        Text("扩展时长 分钟")
+                        Spacer()
+                        TextField("0", value: $bolusMinutes, format: .number)
+                            .keyboardType(.numberPad)
+                            .multilineTextAlignment(.trailing)
+                            .frame(width: 90)
+                    }
+                    HStack { Text("泵内 bolusRatio"); Spacer(); Text("\(vm.bolusRatio)").foregroundStyle(.secondary) }
+                    HStack {
+                        Button("下发大剂量") {
+                            pending = .bolus(total: bolusTotal, extended: bolusExtended,
+                                             minutes: Int(bolusMinutes))
+                        }
+                        Spacer()
+                        Button("停止大剂量", role: .destructive) { vm.stopBolus() }
+                    }
+                    .buttonStyle(.borderless)
+                    Text(vm.bolusText).font(.footnote).foregroundStyle(.secondary)
+                }
+
+                Section("排气 / 回填") {
+                    HStack {
+                        Text("排气量 U")
+                        Spacer()
+                        TextField("2.00", value: $primeUnits, format: .number)
+                            .keyboardType(.decimalPad)
+                            .multilineTextAlignment(.trailing)
+                            .frame(width: 90)
+                    }
+                    HStack {
+                        Button("排气") { pending = .prime(units: primeUnits) }
+                        Spacer()
+                        Button("回填（换储药器）") { vm.rewind() }
                     }
                     .buttonStyle(.borderless)
                 }
@@ -192,6 +327,19 @@ struct PumpView: View {
                 }
             }
             .navigationTitle("微泰 MTM-1")
+            .alert(item: $pending) { action in
+                Alert(title: Text(action.title),
+                      message: Text(action.detail),
+                      primaryButton: .destructive(Text("确认下发")) {
+                          switch action {
+                          case let .bolus(total, extended, minutes):
+                              vm.deliverBolus(total: total, extended: extended, minutes: minutes)
+                          case let .prime(units):
+                              vm.prime(units: units)
+                          }
+                      },
+                      secondaryButton: .cancel(Text("取消")))
+            }
         }
     }
 }

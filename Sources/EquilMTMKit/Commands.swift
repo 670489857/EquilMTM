@@ -77,8 +77,71 @@ public enum EntityCodec {
         return data
     }
 
-    // ⚠️ 大剂量（bolus）编码暂不提供：SDK 里 `setBolusProfile` 有 0.025U 量化 +
-    // `mSettingBolusRatio` 参与的重排算法，未在真机核对前不写出，避免剂量错误。
+    /// 大剂量计划：完全复刻 `PresenterDelivery.setBolusProfile(III)` 的整数运算
+    public struct BolusPlan: Equatable {
+        public var totalMilliUnits: Int
+        public var immediateMilliUnits: Int
+        public var extendedMilliUnits: Int
+        public var immediatePulses: Int
+        public var intervalSeconds: Int
+
+        public init(totalMilliUnits: Int, immediateMilliUnits: Int,
+                    extendedMilliUnits: Int, immediatePulses: Int,
+                    intervalSeconds: Int) {
+            self.totalMilliUnits = totalMilliUnits
+            self.immediateMilliUnits = immediateMilliUnits
+            self.extendedMilliUnits = extendedMilliUnits
+            self.immediatePulses = immediatePulses
+            self.intervalSeconds = intervalSeconds
+        }
+    }
+
+    /// AAPS 侧把胰岛素量换算成 0.001U 整数：`amount * 1000` 后 double-to-int
+    public static func milliUnits(_ units: Double) -> Int { Int(units * 1000) }
+
+    /// 复刻 vendor 算法：量按 0.025U 取整，`mSettingBolusRatio` 参与脉冲重排
+    public static func bolusPlan(totalUnits: Double, extendedUnits: Double,
+                                 intervalSeconds: Int, bolusRatio: Int) -> BolusPlan {
+        var total = milliUnits(totalUnits)
+        total = ((total + 24) / 25) * 25
+        let extendedInput = milliUnits(extendedUnits)
+        var immediate = total > extendedInput ? total - extendedInput : 0
+        immediate = ((immediate + 24) / 25) * 25
+
+        let amount0 = immediate * 25               // `mul-int v1, p2, 0x19`
+        var pulses = (amount0 + 49) / 50           // `(v1 + 0x31) / 0x32`
+        let amount1 = total - amount0
+        let ratio = bolusRatio > 0 ? bolusRatio : 1
+        if pulses > 1 {
+            pulses *= ratio                        // `v2 = v2 * mSettingBolusRatio`
+            let interval0 = (immediate * 360000) / (pulses * 25)
+            if interval0 <= 11200 { pulses -= 1 }  // `0x2bc0 = 11200`
+        }
+        return BolusPlan(totalMilliUnits: total, immediateMilliUnits: immediate,
+                         extendedMilliUnits: amount1, immediatePulses: pulses,
+                         intervalSeconds: intervalSeconds)
+    }
+
+    /// 大剂量实体：两个 profile 各 amount(int32) + interval(int32)，共 16 字节
+    public static func bolusProfile(_ plan: BolusPlan) -> Data {
+        var data = Data(capacity: 16)
+        for value in [plan.immediateMilliUnits * 25, plan.immediatePulses,
+                      plan.extendedMilliUnits, plan.intervalSeconds] {
+            data.append(contentsOf: withUnsafeBytes(of: Int32(value).littleEndian, Array.init))
+        }
+        return data
+    }
+
+    /// 排气：`setPriming` 里 `amount * 4 / 25`（整数截断），单 int32
+    public static func priming(_ units: Double) -> Data {
+        let value = (milliUnits(units) * 4) / 25
+        return Data(withUnsafeBytes(of: Int32(value).littleEndian, Array.init))
+    }
+
+    /// EntityNumber 序列化为 4 字节小端 int（setMode 走的这条）
+    public static func number(_ value: Int) -> Data {
+        Data(withUnsafeBytes(of: Int32(value).littleEndian, Array.init))
+    }
 
     /// 设置：expiration(int32) + autoOff(int32) + 6 个 uint16
     public static func setting(expirationTime: Int32, autoOffTime: Int32,
@@ -159,14 +222,36 @@ public enum PumpCommands {
                 EntityCodec.temporaryProfile(rate: rate, minutes: minutes, percent: percent))
     }
 
-    // ⚠️ bolus 命令待核对后开放（见 EntityCodec 注释）
+    /// 大剂量：amountTotal / amountExtended 走 0.001U，intervalExtended 走秒
+    public static func setBolus(plan: EntityCodec.BolusPlan) -> PumpMessage {
+        message(PumpBus.deliveryPort, .set, DeliveryParameter.bolusProfile.rawValue,
+                EntityCodec.bolusProfile(plan))
+    }
+
+    public static func setBolus(totalUnits: Double, extendedUnits: Double,
+                                intervalSeconds: Int, bolusRatio: Int) -> PumpMessage {
+        let plan = EntityCodec.bolusPlan(totalUnits: totalUnits, extendedUnits: extendedUnits,
+                                         intervalSeconds: intervalSeconds, bolusRatio: bolusRatio)
+        return setBolus(plan: plan)
+    }
+
+    /// 停止大剂量 = setBolusProfile(0, 0, 0)
+    public static func stopBolus() -> PumpMessage {
+        setBolus(plan: EntityCodec.BolusPlan(totalMilliUnits: 0, immediateMilliUnits: 0,
+                                             extendedMilliUnits: 0, immediatePulses: 0,
+                                             intervalSeconds: 0))
+    }
 
     public static func setRunMode(_ mode: PumpRunMode) -> PumpMessage {
         message(PumpBus.deliveryPort, .set, DeliveryParameter.mode.rawValue,
-                Data([UInt8(mode.rawValue)]))
+                EntityCodec.number(mode.rawValue))
     }
 
-    // ⚠️ 排气（priming）的单位未确认，暂不提供
+    /// 排气：量走 0.001U，内部换算为 `amount * 4 / 25`
+    public static func setPriming(units: Double) -> PumpMessage {
+        message(PumpBus.deliveryPort, .set, DeliveryParameter.priming.rawValue,
+                EntityCodec.priming(units))
+    }
 
     public static func rewind() -> PumpMessage {
         message(PumpBus.deliveryPort, .set, DeliveryParameter.rewinding.rawValue)
