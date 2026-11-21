@@ -105,22 +105,41 @@ operation 枚举：`EVENT 0, SET 1, GET 2, WRITE 3, READ 4, NOTIFY 5, ACK 6`。
 读取请求：`EntityMessage(source=9, target=0, 5, 5, GET, 1, data=EntityNumber(1, index))`。
 `deviceTime` 打包规则：`秒 + 分×100 + 时×10000 + 日×1e6 + 月×1e8 + 年×1e10`。
 
-## 7. 大剂量算法（已逐行跟踪，单位未验证 → 暂不启用）
+## 7. 大剂量（setBolusProfile）
 
-`PresenterDelivery.setBolusProfile(amountTotal, amountExtended, intervalExtended)`：
+AAPS 调用前先把胰岛素量换成 0.001U 整数：`Int(amount * 1000)`（`double-to-int`，向零截断）。
+`PresenterDelivery.setBolusProfile(amountTotal, amountExtended, intervalExtended)` 逐行等价于：
 
 ```
-total     = round25(total)                    // round25(x) = ((x + 24) / 25) * 25
-immediate = total > extended ? total - extended : 0
-immediate = round25(immediate)
-extended' = total - immediate
-pulse     = (immediate + 49) / 50             // 以 0.05U 为一档
+total      = round25(Int(totalU * 1000))       // round25(x) = ((x + 24) / 25) * 25
+extendedIn = Int(extendedU * 1000)
+immediate  = total > extendedIn ? total - extendedIn : 0
+immediate  = round25(immediate)
+amount0    = immediate * 25                     // 注意不是 immediate 本身
+pulse      = (amount0 + 49) / 50
+amount1    = total - amount0                    // 可为负：仅当 interval1 > 0 才有意义
 if pulse > 1:
-    pulse = pulse * mSettingBolusRatio        // 设置项 index 10
+    pulse = pulse * mSettingBolusRatio          // 设置项 index 10
     interval0 = (immediate * 360000) / (pulse * 25)
-    if interval0 <= 11200: pulse -= 1
-setInterval(0, pulse); setAmount(0, immediate)
-setInterval(1, intervalExtended); setAmount(1, extended')
+    if interval0 <= 11200: pulse -= 1           // 0x2bc0
 ```
 
-`interval0` 的量纲（毫秒/100ms 刻度）和 `mSettingBolusRatio` 的取值域还没确认真机行为，所以 iOS 端仍不开放写入。
+写入实体（16 字节，小端 int32，按 profile 交错）：
+
+| 偏移 | 字段 |
+|---|---|
+| 0..3 | amount0 = immediate × 25 |
+| 4..7 | interval0 = pulse |
+| 8..11 | amount1 = total − amount0 |
+| 12..15 | interval1 = 扩展时长（秒，AAPS 传 `minutes × 60`） |
+
+停止大剂量 = `setBolusProfile(0, 0, 0)`，即 16 个 0。
+
+## 8. 排气与回填
+
+`setPriming(amount)`：`Int(amount * 4 / 25)`（整数截断），单 int32 小端，parameter = 7。
+回填 `rewinding`：parameter = 6，无数据。
+
+## 9. 运行模式
+
+`setMode(value)` 走 `EntityNumber`，序列化为 **4 字节小端 int32**（不是 1 字节），parameter = 0。
