@@ -1,0 +1,38 @@
+name: EquilMTM
+options:
+  bundleIdPrefix: com.equilmtm
+  deploymentTarget:
+    iOS: "16.0"
+packages:
+  EquilMTMKit:
+    path: .
+targets:
+  EquilMTM:
+    type: application
+    platform: iOS
+    sources:
+      - path: Demo
+    info:
+      path: Demo/Info.plist
+      properties:
+        CFBundleDisplayName: 微泰 MTM-1
+        UILaunchScreen: {}
+        NSBluetoothAlwaysUsageDescription: 连接微泰贴敷泵以读取状态并下发基础率。
+    dependencies:
+      - package: EquilMTMKit
+        product: EquilMTMKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.equilmtm.app
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.9"
+schemes:
+  EquilMTM:
+    build:
+      targets:
+        EquilMTM: all
+    run:
+      config: Debug
+    archive:
+      config: Release
