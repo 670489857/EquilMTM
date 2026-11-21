@@ -8,6 +8,7 @@ public final class PumpSession {
     public var onMessage: ((PumpMessage) -> Void)?
     public var onFrame: ((Frame) -> Void)?
     public var onState: ((PumpBLE.State) -> Void)?
+    public var onDevices: (([PumpDevice]) -> Void)?
 
     public let ble = PumpBLE()
     private var decoder = FrameDecoder()
@@ -21,9 +22,12 @@ public final class PumpSession {
     public init() {
         ble.onReceive = { [weak self] data in self?.receive(data) }
         ble.onStateChange = { [weak self] state in self?.onState?(state) }
+        ble.onDevices = { [weak self] devices in self?.onDevices?(devices) }
     }
 
-    public func connect() { ble.startScan() }
+    public func scan() { ble.startScan() }
+    public func stopScan() { ble.stopScan() }
+    public func connect(_ device: PumpDevice) { ble.connect(device) }
     public func disconnect() { ble.disconnect() }
 
     public func send(_ message: PumpMessage, chunkSize: Int = 20) {

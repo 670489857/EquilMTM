@@ -50,6 +50,9 @@ final class PumpViewModel: ObservableObject {
     @Published var records: [HistoryRecord] = []
     @Published var log: [String] = []
     @Published var bolusRatio: Int = 1
+    @Published var devices: [PumpDevice] = []
+    @Published var scanning = false
+    @Published var selectedID: UUID?
 
     private let session = PumpSession()
 
@@ -57,16 +60,23 @@ final class PumpViewModel: ObservableObject {
         session.onState = { [weak self] state in
             DispatchQueue.main.async {
                 switch state {
-                case .idle: self?.stateText = "未连接"
-                case .scanning: self?.stateText = "扫描中…"
-                case .connecting: self?.stateText = "连接中…"
-                case .ready: self?.stateText = "已连接"
-                case .failed(let error): self?.stateText = "失败：\(error)"
+                case .idle: self?.stateText = "未连接"; self?.scanning = false
+                case .bluetoothOff: self?.stateText = "蓝牙未打开"; self?.scanning = false
+                case .scanning: self?.stateText = "扫描中…"; self?.scanning = true
+                case .connecting: self?.stateText = "连接中…"; self?.scanning = true
+                case .ready: self?.stateText = "已连接"; self?.scanning = false
+                case .failed(let reason): self?.stateText = "失败：\(reason)"; self?.scanning = false
                 }
             }
         }
         session.onMessage = { [weak self] message in
             DispatchQueue.main.async { self?.handle(message) }
+        }
+        session.onDevices = { [weak self] list in
+            DispatchQueue.main.async {
+                self?.devices = list
+                self?.append("扫描到 \(list.count) 个设备")
+            }
         }
         session.onFrame = { [weak self] frame in
             guard !frame.isCRCOK else { return }
@@ -74,7 +84,12 @@ final class PumpViewModel: ObservableObject {
         }
     }
 
-    func connect() { session.connect() }
+    func scan() { session.scan() }
+    func stopScan() { session.stopScan() }
+    func connect(_ device: PumpDevice) {
+        selectedID = device.id
+        session.connect(device)
+    }
     func disconnect() { session.disconnect() }
 
     func readAll() {
@@ -209,14 +224,39 @@ struct PumpView: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("连接") {
+                Section("蓝牙") {
                     HStack { Text("状态"); Spacer(); Text(vm.stateText).foregroundStyle(.secondary) }
                     HStack {
-                        Button("连接") { vm.connect() }
+                        Button(vm.scanning ? "停止扫描" : "扫描设备") {
+                            if vm.scanning { vm.stopScan() } else { vm.scan() }
+                        }
                         Spacer()
                         Button("断开") { vm.disconnect() }
                         Spacer()
                         Button("读状态") { vm.readAll() }
+                    }
+                    ForEach(vm.devices) { device in
+                        Button {
+                            vm.connect(device)
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(device.name)
+                                        .foregroundStyle(device.looksLikePump ? Color.primary : Color.secondary)
+                                    Text("\(device.rssi) dBm  \(device.id.uuidString.prefix(8))")
+                                        .font(.caption2.monospaced())
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                if vm.selectedID == device.id {
+                                    Text("已选择").font(.caption).foregroundStyle(.blue)
+                                }
+                            }
+                        }
+                    }
+                    if vm.devices.isEmpty {
+                        Text(vm.scanning ? "正在扫描，保持泵在附近…" : "点「扫描设备」开始搜索")
+                            .font(.footnote).foregroundStyle(.secondary)
                     }
                 }
 
