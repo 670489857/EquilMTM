@@ -6,6 +6,21 @@ on:
   workflow_dispatch:
 
 jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    container: swift:5.9
+    steps:
+      - uses: actions/checkout@v4
+      - name: Typecheck protocol core (Foundation only)
+        run: |
+          swiftc -typecheck \
+            Sources/EquilMTMKit/CRC.swift \
+            Sources/EquilMTMKit/Message.swift \
+            Sources/EquilMTMKit/Frame.swift \
+            Sources/EquilMTMKit/Commands.swift \
+            Sources/EquilMTMKit/History.swift
+          echo "typecheck OK"
+
   build:
     runs-on: macos-14
     steps:
